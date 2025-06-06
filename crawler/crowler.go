@@ -1,13 +1,16 @@
 package crawler
 
 import (
+	"bytes"
+	"crawler/storage"
 	"crawler/utils"
 	"fmt"
+	"io"
+	"math/rand"
 	"net/http"
 	"sync"
+	"time"
 )
-
-
 var visited = make(map[string]bool)
 var mu sync.Mutex
 
@@ -31,17 +34,40 @@ func Start(url string, depth int) []string {
         mu.Unlock()
 
         fmt.Println("Crawling:", link)
-        resp, err := http.Get(link)
-        if err != nil {
+
+        client := &http.Client{Timeout: 10 * time.Second}
+        req, _ := http.NewRequest("GET", link, nil)
+        req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; MyGoCrawler/1.0)")
+
+        resp, err := client.Do(req)
+        if err != nil || resp.StatusCode != 200 {
             return
         }
         defer resp.Body.Close()
 
-        links := ExtractLinks(resp.Body, link)
+        bodyBytes, err := io.ReadAll(resp.Body)
+        if err != nil {
+            return
+        }
+        bodyReader := bytes.NewReader(bodyBytes)
+
+        title := ExtractTitle(bodyReader)
+        bodyReader.Seek(0, io.SeekStart)
+        links := ExtractLinks(bodyReader, link)
+
+        page := storage.PageData{
+            URL:       link,
+            Title:     title,
+            Status:    resp.StatusCode,
+            FetchedAt: time.Now(),
+        }
+        storage.SavePageToMongo("webcrawler", page)
 
         mu.Lock()
         results = append(results, link)
         mu.Unlock()
+
+        time.Sleep(time.Duration(1+rand.Intn(2)) * time.Second)
 
         for _, l := range links {
             if utils.IsSameDomain(link, l) {
@@ -54,6 +80,5 @@ func Start(url string, depth int) []string {
     wg.Add(1)
     go crawl(url, depth)
     wg.Wait()
-
     return results
 }

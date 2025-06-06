@@ -7,6 +7,14 @@ import (
 	"github.com/PuerkitoBio/goquery"
 )
 
+func ExtractTitle(body io.Reader) string {
+    doc, err := goquery.NewDocumentFromReader(body)
+    if err != nil {
+        return ""
+    }
+    return doc.Find("title").Text()
+}
+
 func ExtractLinks(body io.Reader, base string) []string {
     var links []string
 

@@ -1,17 +1,29 @@
 package main
 
 import (
-	"crawler/config"
 	"crawler/crawler"
 	"crawler/storage"
+	"flag"
 	"fmt"
+	"math/rand"
+	"time"
 )
 
 func main() {
-    cfg := config.ParseFlags()
+    rand.Seed(time.Now().UnixNano())
 
-    results := crawler.Start(cfg.StartURL, cfg.MaxDepth)
-    storage.SaveToFile("results.txt", results)
+    startURL := flag.String("url", "https://books.toscrape.com", "Start URL")
+    depth := flag.Int("depth", 2, "Crawling depth")
+    flag.Parse()
 
-    fmt.Println("Crawling complete. Results saved to results.txt")
+    err := storage.ConnectMongo("mongodb://localhost:27017")
+    if err != nil {
+        fmt.Println("MongoDB connection error:", err)
+        return
+    }
+
+    results := crawler.Start(*startURL, *depth)
+    fmt.Println("Crawled URLs:", results)
+    fmt.Println("Crawling complete. Results saved.")
 }
+
