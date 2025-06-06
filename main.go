@@ -1,69 +1,149 @@
 package main
 
 import (
-	"context"
-	"crawler/crawler"
-	"crawler/storage"
-	"crawler/utils"
 	"fmt"
-	"log"
+	"net/http"
+	"net/url"
+	"sync"
 	"time"
+
+	"github.com/PuerkitoBio/goquery"
 )
 
+const (
+	maxDepth    = 3   // max levels deep to crawl
+	maxPages    = 100 // max total pages to crawl
+	workerCount = 5   // concurrent workers
+	timeout     = 10 * time.Second
+)
 
+type CrawlJob struct {
+	url   string
+	depth int
+}
+
+func fetchLinks(client *http.Client, pageURL string) ([]string, error) {
+	resp, err := client.Get(pageURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("non-200 status code: %d", resp.StatusCode)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var links []string
+	base, err := url.Parse(pageURL)
+	if err != nil {
+		return nil, err
+	}
+
+	doc.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
+		href, exists := s.Attr("href")
+		if !exists {
+			return
+		}
+
+		u, err := url.Parse(href)
+		if err != nil {
+			return
+		}
+
+		absURL := base.ResolveReference(u)
+		links = append(links, absURL.String())
+	})
+
+	return links, nil
+}
+
+func worker(id int, client *http.Client, jobs <-chan CrawlJob, results chan<- []string, visited *sync.Map, wg *sync.WaitGroup, pageCount *int, pageCountMu *sync.Mutex) {
+	defer wg.Done()
+
+	for job := range jobs {
+		if job.depth > maxDepth {
+			continue
+		}
+
+		// Check maxPages limit
+		pageCountMu.Lock()
+		if *pageCount >= maxPages {
+			pageCountMu.Unlock()
+			return
+		}
+		pageCountMu.Unlock()
+
+		// Skip if already visited
+		if _, loaded := visited.LoadOrStore(job.url, true); loaded {
+			continue
+		}
+
+		fmt.Printf("[Worker %d] Crawling: %s (depth %d)\n", id, job.url, job.depth)
+
+		links, err := fetchLinks(client, job.url)
+		if err != nil {
+			fmt.Printf("[Worker %d] Error fetching %s: %s\n", id, job.url, err)
+			continue
+		}
+
+		// Increment page count
+		pageCountMu.Lock()
+		*pageCount++
+		pageCountMu.Unlock()
+
+		results <- links
+	}
+}
 
 func main() {
-    err := storage.ConnectMongo("mongodb://localhost:27017")
-    if err != nil {
-        log.Fatal("MongoDB connect error:", err)
-    }
-    defer storage.DisconnectMongo()
+	startURL := "https://news.ycombinator.com/"
 
-    seed := []string{
-        "https://news.ycombinator.com/",
-        "https://www.bbc.com/",
-        "https://www.geeksforgeeks.org/",
-    }
+	client := &http.Client{
+		Timeout: timeout,
+	}
 
-    queue := make(chan string, 1000)
-    visited := make(map[string]bool)
+	jobs := make(chan CrawlJob, 100)
+	results := make(chan []string, 100)
 
-    for _, u := range seed {
-        queue <- utils.NormalizeURL(u)
-    }
+	var visited sync.Map
+	var wg sync.WaitGroup
 
-    ctx := context.Background()
+	pageCount := 0
+	var pageCountMu sync.Mutex
 
-    for rawurl := range queue {
-        url := utils.NormalizeURL(rawurl)
+	// Start workers
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go worker(i+1, client, jobs, results, &visited, &wg, &pageCount, &pageCountMu)
+	}
 
-        if visited[url] || storage.AlreadyCrawled(url) {
-            continue
-        }
+	// Start with initial URL
+	jobs <- CrawlJob{url: startURL, depth: 0}
 
-        fmt.Println("Crawling:", url)
-        title, links, err := crawler.CrawlPage(ctx, url)
-        if err != nil {
-            fmt.Println("Error crawling:", url, err)
-            visited[url] = true
-            continue
-        }
+	go func() {
+		for links := range results {
+			// For each discovered link, send new crawl job with increased depth
+			pageCountMu.Lock()
+			if pageCount >= maxPages {
+				pageCountMu.Unlock()
+				close(jobs)
+				return
+			}
+			pageCountMu.Unlock()
 
-        err = storage.SavePage(storage.PageData{URL: url, Title: title, Links: links, FetchedAt: time.Now()})
-        if err != nil {
-            fmt.Println("DB save error:", err)
-        }
+			for _, link := range links {
+				jobs <- CrawlJob{url: link, depth: 1} // increase depth, or adapt to actual depth tracking
+			}
+		}
+	}()
 
-        fmt.Printf("Saved: %-50s | found %d links\n", url, len(links))
+	wg.Wait()
+	close(results)
 
-        for _, l := range links {
-            n := utils.NormalizeURL(l)
-            if _, seen := visited[n]; !seen {
-                queue <- n
-            }
-        }
-
-        visited[url] = true
-        time.Sleep(2 * time.Second)
-    }
+	fmt.Println("Crawling completed.")
 }
