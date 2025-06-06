@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"crawler/storage"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -8,12 +10,16 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+
+
 const (
-	maxDepth    = 3   // max levels deep to crawl
-	maxPages    = 100 // max total pages to crawl
-	workerCount = 5   // concurrent workers
+	maxDepth    = 3
+	maxPages    = 100
+	workerCount = 5
 	timeout     = 10 * time.Second
 )
 
@@ -62,7 +68,7 @@ func fetchLinks(client *http.Client, pageURL string) ([]string, error) {
 	return links, nil
 }
 
-func worker(id int, client *http.Client, jobs <-chan CrawlJob, results chan<- []string, visited *sync.Map, wg *sync.WaitGroup, pageCount *int, pageCountMu *sync.Mutex) {
+func worker(id int, client *http.Client, mongoClient *mongo.Client, jobs <-chan CrawlJob, results chan<- []string, visited *sync.Map, wg *sync.WaitGroup, pageCount *int, pageCountMu *sync.Mutex) {
 	defer wg.Done()
 
 	for job := range jobs {
@@ -70,7 +76,6 @@ func worker(id int, client *http.Client, jobs <-chan CrawlJob, results chan<- []
 			continue
 		}
 
-		// Check maxPages limit
 		pageCountMu.Lock()
 		if *pageCount >= maxPages {
 			pageCountMu.Unlock()
@@ -78,7 +83,6 @@ func worker(id int, client *http.Client, jobs <-chan CrawlJob, results chan<- []
 		}
 		pageCountMu.Unlock()
 
-		// Skip if already visited
 		if _, loaded := visited.LoadOrStore(job.url, true); loaded {
 			continue
 		}
@@ -91,7 +95,12 @@ func worker(id int, client *http.Client, jobs <-chan CrawlJob, results chan<- []
 			continue
 		}
 
-		// Increment page count
+		// Save page URL to MongoDB
+		err = storage.SavePageToMongo(mongoClient, job.url)
+		if err != nil {
+			fmt.Printf("[Worker %d] Error saving to Mongo: %v\n", id, err)
+		}
+
 		pageCountMu.Lock()
 		*pageCount++
 		pageCountMu.Unlock()
@@ -101,11 +110,15 @@ func worker(id int, client *http.Client, jobs <-chan CrawlJob, results chan<- []
 }
 
 func main() {
-	startURL := "https://news.ycombinator.com/"
+	startURL := "https://old.reddit.com/"
 
-	client := &http.Client{
-		Timeout: timeout,
+	client := &http.Client{Timeout: timeout}
+
+	mongoClient, err := mongo.Connect(context.Background(), options.Client().ApplyURI("mongodb://localhost:27017"))
+	if err != nil {
+		panic(err)
 	}
+	defer mongoClient.Disconnect(context.Background())
 
 	jobs := make(chan CrawlJob, 100)
 	results := make(chan []string, 100)
@@ -119,15 +132,13 @@ func main() {
 	// Start workers
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go worker(i+1, client, jobs, results, &visited, &wg, &pageCount, &pageCountMu)
+		go worker(i+1, client, mongoClient, jobs, results, &visited, &wg, &pageCount, &pageCountMu)
 	}
 
-	// Start with initial URL
 	jobs <- CrawlJob{url: startURL, depth: 0}
 
 	go func() {
 		for links := range results {
-			// For each discovered link, send new crawl job with increased depth
 			pageCountMu.Lock()
 			if pageCount >= maxPages {
 				pageCountMu.Unlock()
@@ -137,7 +148,7 @@ func main() {
 			pageCountMu.Unlock()
 
 			for _, link := range links {
-				jobs <- CrawlJob{url: link, depth: 1} // increase depth, or adapt to actual depth tracking
+				jobs <- CrawlJob{url: link, depth: 1}
 			}
 		}
 	}()
